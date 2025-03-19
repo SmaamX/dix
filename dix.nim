@@ -1,40 +1,42 @@
 import sequtils, strutils, math, tables
 
-proc getUniqueChunks(inputFile: string): (seq[string], seq[int]) =
+proc compressLZW(inputFile, compressedFile: string) =
   let data = readFile(inputFile)
-  var chunkMap = initTable[string, int]()
-  var uniqueChunks: seq[string] = @[]
-  var indices: seq[int] = @[]
-  let chunkSize = 4
-  for i in countup(0, data.len - 1, chunkSize):
-    let chunk = if i + chunkSize - 1 < data.len: data[i .. i + chunkSize - 1] else: data[i .. ^1] & "\0".repeat(chunkSize - (data.len - i))
-    if not chunkMap.hasKey(chunk):
-      chunkMap[chunk] = uniqueChunks.len
-      uniqueChunks.add(chunk)
-    indices.add(chunkMap[chunk])
-  return (uniqueChunks, indices)
-
-proc compress(inputFile, compressedFile: string) =
-  let data = readFile(inputFile)
-  let (uniqueChunks, indices) = getUniqueChunks(inputFile)
-  let bitsPerIndex = max(1, ceil(log2(float(uniqueChunks.len))).int)
-  var compressed: seq[byte] = @[]
-  compressed.add(byte(uniqueChunks.len shr 8))
-  compressed.add(byte(uniqueChunks.len))
-  compressed.add(byte(bitsPerIndex))
-  compressed.add(byte(data.len shr 24))
-  compressed.add(byte(data.len shr 16))
-  compressed.add(byte(data.len shr 8))
-  compressed.add(byte(data.len))
-  for chunk in uniqueChunks:
-    for c in chunk:
-      compressed.add(byte(c))
+  var dictionary = initTable[string, int]()
+  for i in 0 .. 255:
+    dictionary[$char(i)] = i
+  var current = ""
+  var compressed: seq[int] = @[]
+  var nextCode = 256
+  for c in data:
+    let combined = current & c
+    if dictionary.hasKey(combined):
+      current = combined
+    else:
+      compressed.add(dictionary[current])
+      dictionary[combined] = nextCode
+      nextCode += 1
+      current = $c
+  if current.len > 0:
+    compressed.add(dictionary[current])
+  let bitsPerCode = max(9, ceil(log2(float(nextCode))).int)
+  let seed = 12345'u32
+  var output: seq[byte] = @[]
+  output.add(byte(data.len shr 24))
+  output.add(byte(data.len shr 16))
+  output.add(byte(data.len shr 8))
+  output.add(byte(data.len))
+  output.add(byte(seed shr 24))
+  output.add(byte(seed shr 16))
+  output.add(byte(seed shr 8))
+  output.add(byte(seed))
+  output.add(byte(bitsPerCode))
   var bits: seq[byte] = @[]
   var bitCount = 0
   var currentByte = 0'u8
-  for idx in indices:
-    var value = uint64(idx)
-    var bitsLeft = bitsPerIndex
+  for code in compressed:
+    var value = uint64(code)
+    var bitsLeft = bitsPerCode
     while bitsLeft > 0:
       let bitsToWrite = min(8 - bitCount, bitsLeft)
       let shift = bitsLeft - bitsToWrite
@@ -48,53 +50,58 @@ proc compress(inputFile, compressedFile: string) =
       value = value and ((1'u64 shl shift) - 1)
   if bitCount > 0:
     bits.add(currentByte)
-  compressed.add(bits)
-  writeFile(compressedFile, compressed)
+  output.add(bits)
+  writeFile(compressedFile, output)
 
-proc decompress(compressedFile, outputFile: string) =
+proc decompressLZW(compressedFile, outputFile: string) =
   let compressed = readFile(compressedFile).toSeq.mapIt(byte(it))
-  let uniqueChunksLen = (int(compressed[0]) shl 8) or int(compressed[1])
-  let bitsPerIndex = int(compressed[2])
-  let originalSize = (int(compressed[3]) shl 24) or (int(compressed[4]) shl 16) or (int(compressed[5]) shl 8) or int(compressed[6])
-  var uniqueChunks: seq[string] = @[]
-  let chunkSize = 4
-  var chunkStart = 7
-  for i in 0 ..< uniqueChunksLen:
-    uniqueChunks.add(compressed[chunkStart .. chunkStart + chunkSize - 1].mapIt(char(it)).join(""))
-    chunkStart += chunkSize
-  let headerSize = 7 + uniqueChunksLen * chunkSize
-  if headerSize >= compressed.len:
-    return
-  let compressedData = compressed[headerSize .. ^1]
-  var indices: seq[int] = @[]
+  let originalSize = (int(compressed[0]) shl 24) or (int(compressed[1]) shl 16) or (int(compressed[2]) shl 8) or int(compressed[3])
+  discard (uint32(compressed[4]) shl 24) or (uint32(compressed[5]) shl 16) or (uint32(compressed[6]) shl 8) or uint32(compressed[7])  # seed
+  let bitsPerCode = int(compressed[8])
+  let compressedData = compressed[9 .. ^1]
+  var dictionary = initTable[int, string]()
+  for i in 0 .. 255:
+    dictionary[i] = $char(i)
+  var nextCode = 256
+  var codes: seq[int] = @[]
   var bits: uint64 = 0
   var bitCount = 0
   for b in compressedData:
     bits = (bits shl 8) or uint64(b)
     bitCount += 8
-    while bitCount >= bitsPerIndex:
-      let mask = (1'u64 shl bitsPerIndex) - 1
-      let index = int((bits shr (bitCount - bitsPerIndex)) and mask)
-      if index < uniqueChunks.len:
-        indices.add(index)
-      bitCount -= bitsPerIndex
+    while bitCount >= bitsPerCode:
+      let mask = (1'u64 shl bitsPerCode) - 1
+      let code = int((bits shr (bitCount - bitsPerCode)) and mask)
+      codes.add(code)
+      bitCount -= bitsPerCode
       bits = bits and ((1'u64 shl bitCount) - 1)
-  var decompressed: seq[byte] = @[]
-  for idx in indices:
-    if decompressed.len < originalSize:
-      let chunk = uniqueChunks[idx]
-      for c in chunk:
-        if decompressed.len < originalSize:
-          decompressed.add(byte(c))
-  writeFile(outputFile, decompressed)
+  var decompressed = ""
+  var current = dictionary[codes[0]]
+  decompressed &= current
+  for i in 1 ..< codes.len:
+    let code = codes[i]
+    var entry = ""
+    if dictionary.hasKey(code):
+      entry = dictionary[code]
+    elif code == nextCode:
+      entry = current & current[0]
+    else:
+      break
+    decompressed &= entry
+    dictionary[nextCode] = current & entry[0]
+    nextCode += 1
+    current = entry
+    if decompressed.len >= originalSize:
+      break
+  writeFile(outputFile, decompressed[0 ..< originalSize])
 
 when isMainModule:
   let inputFile = "input.txt"
   let compressedFile = "compressed.dix"
-  let outputFile = "d_input.txt"
+  let outputFile = "dinput.txt"
   echo "Compressing..."
-  compress(inputFile, compressedFile)
+  compressLZW(inputFile, compressedFile)
   echo "Compressed to ", compressedFile, " (size: ", readFile(compressedFile).len, " bytes)"
   echo "Decompressing..."
-  decompress(compressedFile, outputFile)
+  decompressLZW(compressedFile, outputFile)
   echo "File reconstructed as ", outputFile
